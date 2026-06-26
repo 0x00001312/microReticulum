@@ -226,6 +226,26 @@ void test_receipt_timeout_callback() {
 // Transport hashlist tests
 // ============================================================================
 
+void test_discover_paths_for_matches_upstream_modes() {
+	uint8_t discover_modes = RNS::Interface::DISCOVER_PATHS_FOR;
+
+	TEST_ASSERT_TRUE_MESSAGE(
+		(discover_modes & RNS::Type::Interface::MODE_ACCESS_POINT) > 0,
+		"Access point interfaces should discover unknown paths");
+	TEST_ASSERT_TRUE_MESSAGE(
+		(discover_modes & RNS::Type::Interface::MODE_GATEWAY) > 0,
+		"Gateway interfaces should discover unknown paths");
+	TEST_ASSERT_TRUE_MESSAGE(
+		(discover_modes & RNS::Type::Interface::MODE_ROAMING) > 0,
+		"Roaming interfaces should discover unknown paths");
+	TEST_ASSERT_FALSE_MESSAGE(
+		(discover_modes & RNS::Type::Interface::MODE_FULL) > 0,
+		"Full interfaces should not discover paths on behalf of peers");
+	TEST_ASSERT_FALSE_MESSAGE(
+		(discover_modes & RNS::Type::Interface::MODE_BOUNDARY) > 0,
+		"Boundary interfaces should not discover paths on behalf of peers");
+}
+
 void test_hashlist_basic() {
 	// Send enough packets that the hashlist should grow
 	initRNS();
@@ -579,6 +599,8 @@ void tearDown(void) {}
 
 int runUnityTests(void) {
 	UNITY_BEGIN();
+
+	RUN_TEST(test_discover_paths_for_matches_upstream_modes);
 
 /*
 	// Transport receipt lifecycle
