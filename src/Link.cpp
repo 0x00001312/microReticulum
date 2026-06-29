@@ -853,86 +853,150 @@ void Link::link_closed() {
 	}
 }
 
-// CBA TODO Implement watchdog
+// The reference implementation runs this on its own daemon thread, sleeping
+// between checks. This port is single-threaded (ESP32/Arduino, one loop()),
+// so there's no thread to start here -- instead Transport::jobs() calls
+// __watchdog_job() directly, once per link, on its existing ~1s
+// _links_check_interval sweep of _pending_links/_active_links. Kept as its
+// own no-op entry point (rather than removing it) so the call sites in this
+// file -- which mark exactly when a link becomes pending/active, matching
+// where the reference implementation starts its thread -- don't need to
+// change, and so the historical TODO is resolved by the real polling
+// implementation below it.
 void Link::start_watchdog() {
-	//z thread = threading.Thread(target=_object->___watchdog_job)
-	//z thread.daemon = True
-	//z thread.start()
 }
 
-/*p TODO
-
+// Single-pass tick (see start_watchdog() above for why this isn't a sleeping
+// loop): handles establishment timeout for PENDING/HANDSHAKE links, and
+// keepalive/stale/timeout for ACTIVE links. Ported from the reference
+// implementation's threaded __watchdog_job, with each "sleep until next
+// check" replaced by "do nothing until the next poll" -- the actual
+// thresholds and grace periods are unchanged.
+//
+// Without this, a link that never gets a response (PENDING), never gets its
+// RTT/proof (HANDSHAKE), or simply goes quiet (ACTIVE, e.g. the peer walked
+// out of LoRa range) never times out and never closes: it sits in
+// Transport::_pending_links/_active_links forever, ready_for_new_resource()
+// stays false for it, and any Resource transfer riding on it stalls
+// silently (link_closed() below is what cancels those resources) instead of
+// failing and letting the caller retry.
 void Link::__watchdog_job() {
 	assert(_object);
-	while not _object->_status == Type::Link::CLOSED:
-		while (_object->_watchdog_lock):
-			rtt_wait = 0.025
-			if hasattr(self, "rtt") and _object->_rtt:
-				rtt_wait = _object->_rtt
+	if (_object->_status == Type::Link::CLOSED) return;
 
-			sleep(max(rtt_wait, 0.025))
+	if (_object->_status == Type::Link::PENDING) {
+		// Link was initiated, but no response from destination yet.
+		if (OS::time() >= _object->_request_time + _object->_establishment_timeout) {
+			DEBUG("Link establishment timed out");
+			_object->_status = Type::Link::CLOSED;
+			_object->_teardown_reason = Type::Link::TIMEOUT;
+			link_closed();
+		}
+	}
+	else if (_object->_status == Type::Link::HANDSHAKE) {
+		if (OS::time() >= _object->_request_time + _object->_establishment_timeout) {
+			_object->_status = Type::Link::CLOSED;
+			_object->_teardown_reason = Type::Link::TIMEOUT;
+			link_closed();
+			if (_object->_initiator) {
+				DEBUG("Timeout waiting for link request proof");
+			}
+			else {
+				DEBUG("Timeout waiting for RTT packet from link initiator");
+			}
+		}
+	}
+	else if (_object->_status == Type::Link::ACTIVE) {
+		double activated_at = _object->_activated_at;
+		double last_inbound = std::max({_object->_last_inbound, _object->_last_proof, activated_at});
 
-		if not _object->_status == Type::Link::CLOSED:
-			# Link was initiated, but no response
-			# from destination yet
-			if _object->_status == PENDING:
-				next_check = _object->_request_time + _object->_establishment_timeout
-				sleep_time = next_check - OS::time()
-				if OS::time() >= _object->_request_time + _object->_establishment_timeout:
-					RNS.log("Link establishment timed out", RNS.LOG_VERBOSE)
-					_object->_status = Type::Link::CLOSED
-					_object->_teardown_reason = TIMEOUT
-					link_closed()
-					sleep_time = 0.001
+		if (OS::time() >= last_inbound + _object->_keepalive) {
+			if (_object->_initiator) {
+				send_keepalive();
+			}
+			if (OS::time() >= last_inbound + _object->_stale_time) {
+				_object->_status = Type::Link::STALE;
+				_object->_stale_at = OS::time();
+			}
+		}
 
-			elif _object->_status == Type::Link::HANDSHAKE:
-				next_check = _object->_request_time + _object->_establishment_timeout
-				sleep_time = next_check - OS::time()
-				if OS::time() >= _object->_request_time + _object->_establishment_timeout:
-					_object->_status = Type::Link::CLOSED
-					_object->_teardown_reason = TIMEOUT
-					link_closed()
-					sleep_time = 0.001
+		resource_watchdog_tick();
+	}
+	else if (_object->_status == Type::Link::STALE) {
+		// Reference implementation waits rtt*keepalive_timeout_factor +
+		// STALE_GRACE after going stale before giving up entirely, in case
+		// a delayed keepalive/proof is still in flight (plausible on a
+		// high-RTT link like LoRa) -- not an immediate close.
+		double grace = _object->_rtt * _object->_keepalive_timeout_factor + Type::Link::STALE_GRACE;
+		if (OS::time() >= _object->_stale_at + grace) {
+			_object->_status = Type::Link::CLOSED;
+			_object->_teardown_reason = Type::Link::TIMEOUT;
+			link_closed();
+		}
+	}
+}
 
-					if _object->_initiator:
-						RNS.log("Timeout waiting for link request proof", RNS.LOG_DEBUG)
-					else:
-						RNS.log("Timeout waiting for RTT packet from link initiator", RNS.LOG_DEBUG)
+// Resources have no thread/timer of their own on this single-threaded port
+// (see __watchdog_job() above) -- a single lost RESOURCE_ADV, RESOURCE_REQ,
+// or RESOURCE_PRF would otherwise stall a transfer forever even while the
+// Link itself stays perfectly healthy (peer still sending other traffic or
+// keepalives), since nothing else ever re-sends them. Scaled off this
+// Link's own measured RTT (like the STALE grace period above) rather than a
+// flat constant: a fixed timeout tuned for a fast link would fire spuriously
+// on LoRa, retransmitting parts that are simply still in the air.
+void Link::resource_watchdog_tick() {
+	assert(_object);
+	constexpr double RESOURCE_RETRY_FLOOR_S = 5.0;
+	constexpr double RESOURCE_RETRY_RTT_FACTOR = 8.0;
+	constexpr int RESOURCE_MAX_RETRIES = 5;
+	double timeout = std::max(RESOURCE_RETRY_FLOOR_S, _object->_rtt * RESOURCE_RETRY_RTT_FACTOR);
 
-			elif _object->_status == Type::Link::ACTIVE:
-				activated_at = _object->_activated_at if _object->_activated_at != None else 0
-				last_inbound = max(max(_object->_last_inbound, _object->_last_proof), activated_at)
+	for (auto& resource : _object->_outbound_resources) {
+		if (resource->status() != ResourceStatus::ADVERTISED) continue;  // already TRANSFERRING/concluded
+		if (OS::time() - resource->last_activity_at() < timeout) continue;
+		if (resource->retries() >= RESOURCE_MAX_RETRIES) {
+			DEBUG("Outbound resource timed out waiting for request -- giving up");
+			resource->mark_failed();
+			continue;
+		}
+		resource->increment_retries();
+		resource->mark_activity();
+		Bytes encrypted_adv = encrypt(resource->get_advertisement().pack());
+		if (encrypted_adv) {
+			Packet adv_packet(*this, encrypted_adv, Type::Packet::DATA, Type::Packet::RESOURCE_ADV);
+			adv_packet.send();
+			had_outbound(true);
+		}
+	}
+	_object->_outbound_resources.erase(
+		std::remove_if(_object->_outbound_resources.begin(), _object->_outbound_resources.end(),
+			[](const std::shared_ptr<OutboundResource>& r) { return r->status() == ResourceStatus::FAILED; }),
+		_object->_outbound_resources.end());
 
-				if OS::time() >= last_inbound + _object->_keepalive:
-					if _object->_initiator:
-						send_keepalive()
-
-					if OS::time() >= last_inbound + _object->_stale_time:
-						sleep_time = _object->_rtt * _object->_keepalive_timeout_factor + STALE_GRACE
-						_object->_status = STALE
-					else:
-						sleep_time = _object->_keepalive
-				
-				else:
-					sleep_time = (last_inbound + _object->_keepalive) - OS::time()
-
-			elif _object->_status == STALE:
-				sleep_time = 0.001
-				_object->_status = Type::Link::CLOSED
-				_object->_teardown_reason = TIMEOUT
-				link_closed()
-
-
-			if sleep_time == 0:
-				RNS.log("Warning! Link watchdog sleep time of 0!", RNS.LOG_ERROR)
-			if sleep_time == None or sleep_time < 0:
-				RNS.log("Timing error! Tearing down link "+str(self)+" now.", RNS.LOG_ERROR)
-				teardown()
-				sleep_time = 0.1
-
-			sleep(sleep_time)
-
-*/
+	for (auto& resource : _object->_inbound_resources) {
+		if (resource->is_complete()) continue;  // assembled on this same tick elsewhere, or about to be
+		if (OS::time() - resource->last_request_at() < timeout) continue;
+		if (resource->retries() >= RESOURCE_MAX_RETRIES) {
+			DEBUG("Inbound resource timed out waiting for missing parts -- giving up");
+			resource->mark_failed();
+			continue;
+		}
+		resource->increment_retries();
+		Bytes req = resource->next_request();
+		if (req.size() > 0) {
+			Bytes encrypted = encrypt(req);
+			if (encrypted) {
+				Packet req_packet(*this, encrypted, Type::Packet::DATA, Type::Packet::RESOURCE_REQ);
+				req_packet.send();
+				had_outbound(true);
+			}
+		}
+	}
+	_object->_inbound_resources.erase(
+		std::remove_if(_object->_inbound_resources.begin(), _object->_inbound_resources.end(),
+			[](const std::shared_ptr<InboundResource>& r) { return r->status() == ResourceStatus::FAILED; }),
+		_object->_inbound_resources.end());
+}
 
 void Link::send_keepalive() {
 	assert(_object);
@@ -1283,8 +1347,10 @@ void Link::receive(const Packet& packet) {
 								auto inbound = std::make_shared<InboundResource>();
 								if (inbound->init(adv, *this)) {
 									_object->_inbound_resources.push_back(inbound);
-									// Send initial request
-									Bytes req = inbound->get_initial_request();
+									// Send initial request (first window's worth -- see
+									// InboundResource::next_request() for how later batches
+									// and retries are driven)
+									Bytes req = inbound->next_request();
 									if (req.size() > 0) {
 										Bytes encrypted = encrypt(req);
 										if (encrypted) {
@@ -1379,11 +1445,52 @@ void Link::receive(const Packet& packet) {
 									// Store assembled data for later retrieval
 									_object->_last_resource_data = assembled;
 									DEBUGF("Inbound resource complete, %d bytes assembled", (int)assembled.size());
+
+									// Deliver to the application the same way a small,
+									// single-packet link message would (CONTEXT_NONE case
+									// above) -- without this, a fully and correctly
+									// assembled resource (e.g. a long LXMF message) was
+									// silently dropped: nothing besides the line above (an
+									// internal field nothing else ever read) ever learned
+									// the transfer completed.
+									if (_object->_callbacks._packet) {
+										try {
+											_object->_callbacks._packet(assembled, packet);
+										}
+										catch (std::exception& e) {
+											ERRORF("Error while executing packet callback for assembled resource from %s. The contained exception was: %s", toString().c_str(), e.what());
+										}
+									}
+								}
+								// Falls through to the prune sweep below regardless of
+								// assemble() success -- assemble() marks CORRUPT on
+								// failure, which is just as conclusive as COMPLETE here.
+							}
+							else if (resource->should_request_more()) {
+								Bytes req = resource->next_request();
+								if (req.size() > 0) {
+									Bytes encrypted = encrypt(req);
+									if (encrypted) {
+										Packet req_packet(*this, encrypted, Type::Packet::DATA, Type::Packet::RESOURCE_REQ);
+										req_packet.send();
+										had_outbound(true);
+									}
 								}
 							}
 							break;
 						}
 					}
+					// Free concluded resources' slot -- otherwise a finished transfer
+					// (successful or not) stays in this list forever, since nothing
+					// else here ever erases from it.
+					_object->_inbound_resources.erase(
+						std::remove_if(_object->_inbound_resources.begin(), _object->_inbound_resources.end(),
+							[](const std::shared_ptr<InboundResource>& r) {
+								ResourceStatus st = r->status();
+								return st == ResourceStatus::COMPLETE || st == ResourceStatus::CORRUPT
+									|| st == ResourceStatus::FAILED;
+							}),
+						_object->_inbound_resources.end());
 					break;
 				}
 				// CHANNEL case — not yet implemented
@@ -1400,6 +1507,17 @@ void Link::receive(const Packet& packet) {
 								break;
 							}
 						}
+						// Free this slot -- without this, ready_for_new_resource()
+						// (gates start_resource_transfer()) stays permanently false
+						// after the very first resource ever sent on this Link, since
+						// nothing else here ever erases a concluded entry.
+						_object->_outbound_resources.erase(
+							std::remove_if(_object->_outbound_resources.begin(), _object->_outbound_resources.end(),
+								[](const std::shared_ptr<OutboundResource>& r) {
+									ResourceStatus st = r->status();
+									return st == ResourceStatus::COMPLETE || st == ResourceStatus::FAILED;
+								}),
+							_object->_outbound_resources.end());
 					}
 				}
 			}

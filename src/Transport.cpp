@@ -278,6 +278,14 @@ Transport::DestinationEntry empty_destination_entry;
 			if (OS::time() > (_links_last_checked + _links_check_interval)) {
 				std::set<Link> pending_links(_pending_links);
 				for (auto& link : pending_links) {
+					// Drives Link::__watchdog_job() (see there) -- this is the
+					// only place a PENDING link (initiated, no response yet)
+					// ever gets its establishment_timeout enforced, since this
+					// port has no thread to run the reference implementation's
+					// watchdog loop on.
+					if (link.status() != Type::Link::CLOSED) {
+						const_cast<Link&>(link).__watchdog_job();
+					}
 					if (link.status() == Type::Link::CLOSED) {
 						// If we are not a Transport Instance, finding a pending link
 						// that was never activated will trigger an expiry of the path
@@ -311,6 +319,15 @@ Transport::DestinationEntry empty_destination_entry;
 				}
 				std::set<Link> active_links(_active_links);
 				for (auto& link : active_links) {
+					// Drives Link::__watchdog_job() (see there) -- handles
+					// HANDSHAKE establishment timeout, and ACTIVE
+					// keepalive/stale/timeout. Checked first so a link that
+					// just timed out is erased below in the same pass, and so
+					// retry_proof() (a "still trying" action) doesn't fire on
+					// the same tick __watchdog_job() already gave up on it.
+					if (link.status() != Type::Link::CLOSED) {
+						const_cast<Link&>(link).__watchdog_job();
+					}
 					if (link.status() == Type::Link::CLOSED) {
 						_active_links.erase(link);
 					}

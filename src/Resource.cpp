@@ -15,6 +15,7 @@
 #include <algorithm>
 
 using namespace RNS;
+using namespace RNS::Utilities;
 
 // ============================================================
 // MsgPack helpers (manual encoding for deterministic output)
@@ -311,6 +312,7 @@ bool OutboundResource::init(const Bytes& plaintext, Link& link, bool /*auto_comp
 
     _hashmap = hashmap_bytes;
     _status = ResourceStatus::ADVERTISED;
+    _last_activity_at = OS::time();
     return true;
 }
 
@@ -367,6 +369,7 @@ std::vector<size_t> OutboundResource::handle_request(const Bytes& request_data) 
     }
 
     _status = ResourceStatus::TRANSFERRING;
+    _last_activity_at = OS::time();
     return indices;
 }
 
@@ -412,6 +415,7 @@ bool InboundResource::receive_part(const Bytes& data) {
         if (memcmp(_map_hashes[i].data(), mh, 4) == 0 && _parts[i].size() == 0) {
             _parts[i] = data;
             _received++;
+            _received_since_request++;
             return true;
         }
     }
@@ -474,20 +478,47 @@ Bytes InboundResource::generate_proof() const {
     return compute_expected_proof(assembled, _resource_hash);
 }
 
-Bytes InboundResource::get_initial_request() const {
-    // Build request: [exhausted(1)][resource_hash(32)][wanted_hashes(N*4)]
+Bytes InboundResource::next_request() {
+    // Build request: [exhausted(1)][?last_map_hash(4)][resource_hash(32)][wanted_hashes(N*4)]
+    // -- see OutboundResource::handle_request() for the matching parse.
+    //
+    // Recomputed from scratch (scan for the first _window still-empty
+    // slots) every call, rather than advancing a separate watermark: that
+    // makes this naturally idempotent. Called again after a part arrives
+    // (should_request_more()) it picks up the next batch; called again on
+    // a retry timeout with nothing new received, it re-asks for exactly
+    // the same batch. No separate "resend" code path needed.
+    std::vector<size_t> missing;
+    size_t total_missing = 0;
+    for (size_t i = 0; i < _total_parts; i++) {
+        if (_parts[i].size() == 0) {
+            total_missing++;
+            if (missing.size() < _window) missing.push_back(i);
+        }
+    }
+    if (missing.empty()) return Bytes();  // nothing left to ask for
+
+    // This port always sends the complete hashmap in one RESOURCE_ADV (no
+    // incremental RESOURCE_HMU chunking -- see its handler in Link.cpp), so
+    // "exhausted" here only ever means "nothing more after this batch", not
+    // "but there's an extended hashmap coming". The optional last_map_hash
+    // field the sender's parser skips in that case is wire-format filler
+    // it never reads back; using the true last map hash anyway costs
+    // nothing and matches the documented format.
+    bool exhausted = (total_missing <= missing.size());
+
     Bytes request;
-    request.append((uint8_t)0x00);  // HASHMAP_IS_NOT_EXHAUSTED
-
-    // Resource hash
+    request.append((uint8_t)(exhausted ? 0xFF : 0x00));
+    if (exhausted && !_map_hashes.empty()) {
+        request.append(_map_hashes.back().data(), 4);
+    }
     request.append(_resource_hash, 32);
-
-    // Request all map hashes (initial window)
-    size_t count = std::min(_window, _map_hashes.size());
-    for (size_t i = 0; i < count; i++) {
-        request.append(_map_hashes[i].data(), 4);
+    for (size_t idx : missing) {
+        request.append(_map_hashes[idx].data(), 4);
     }
 
+    _received_since_request = 0;
+    _last_request_at = OS::time();
     return request;
 }
 

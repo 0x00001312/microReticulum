@@ -4,12 +4,14 @@
 #include <unity.h>
 #include "Identity.h"
 #include "Resource.h"
+#include "Link.h"
 #include "Compression/BZ2.h"
 #include "Cryptography/Hashes.h"
 
 #include <string.h>
 #include <stdio.h>
 #include <cmath>
+#include <vector>
 
 static void printHex(const char* label, const uint8_t* data, size_t len) {
     printf("  %s = ", label);
@@ -201,6 +203,95 @@ void testAdvertisementWithRequestId() {
     TEST_ASSERT_EQUAL_MEMORY("\xDE\xAD\xBE\xEF", unpacked.request_id.data(), 4);
 }
 
+// ── Regression: InboundResource must complete transfers larger than one
+// request window (Type::Resource::WINDOW == 4) ──────────────────────────
+//
+// Before the windowed-retry fix, InboundResource only ever sent ONE request
+// (for the first WINDOW parts) right after accepting the advertisement, and
+// nothing ever asked for the remaining parts. Any resource needing more
+// than WINDOW parts could therefore never become complete -- this directly
+// reproduces and verifies the fix for that, end to end at the protocol
+// level (no real Link/encryption needed: receive_part() matches purely by
+// map hash, and init()/this test never call assemble(), which is the only
+// place link decryption happens).
+void testInboundResourceCompletesAcrossMultipleWindows() {
+    const size_t kNumParts = 10;  // > Type::Resource::WINDOW (4) on purpose
+    TEST_ASSERT_TRUE(kNumParts > RNS::Type::Resource::WINDOW);
+
+    uint8_t random_hash[4] = {0xAA, 0xBB, 0xCC, 0xDD};
+    std::vector<RNS::Bytes> chunks;
+    RNS::Bytes hashmap;
+    for (size_t i = 0; i < kNumParts; i++) {
+        uint8_t data[16];
+        memset(data, (uint8_t)(0x10 + i), sizeof(data));
+        RNS::Bytes chunk(data, sizeof(data));
+        chunks.push_back(chunk);
+
+        uint8_t mh[4];
+        RNS::get_map_hash(chunk.data(), chunk.size(), random_hash, 4, mh);
+        hashmap.append(mh, 4);
+    }
+
+    RNS::ResourceAdvertisement adv;
+    adv.transfer_size = kNumParts * 16;
+    adv.data_size = adv.transfer_size;
+    adv.num_parts = kNumParts;
+    memset(adv.resource_hash, 0x55, 32);
+    memcpy(adv.random_hash, random_hash, 4);
+    memset(adv.original_hash, 0x55, 32);
+    adv.hashmap = hashmap;
+
+    RNS::Link noneLink({RNS::Type::NONE});  // init() never dereferences this
+    RNS::InboundResource inbound;
+    TEST_ASSERT_TRUE(inbound.init(adv, noneLink));
+    TEST_ASSERT_FALSE(inbound.is_complete());
+
+    int rounds = 0;
+    while (!inbound.is_complete()) {
+        RNS::Bytes req = inbound.next_request();
+        TEST_ASSERT_TRUE(req.size() > 0);
+        rounds++;
+        TEST_ASSERT_TRUE(rounds <= 10);  // safety net against an infinite loop bug
+
+        // Parse [exhausted(1)][?last_map_hash(4)][resource_hash(32)][wanted(N*4)]
+        // -- mirrors OutboundResource::handle_request()'s own parse.
+        size_t pos = 0;
+        uint8_t exhausted = req.data()[pos++];
+        if (exhausted == 0xFF) pos += 4;
+        TEST_ASSERT_TRUE(pos + 32 <= req.size());
+        TEST_ASSERT_EQUAL_MEMORY(adv.resource_hash, req.data() + pos, 32);
+        pos += 32;
+
+        size_t requested_in_round = 0;
+        while (pos + 4 <= req.size()) {
+            uint8_t wanted[4];
+            memcpy(wanted, req.data() + pos, 4);
+            pos += 4;
+            requested_in_round++;
+
+            bool matched = false;
+            for (size_t i = 0; i < kNumParts; i++) {
+                uint8_t mh[4];
+                RNS::get_map_hash(chunks[i].data(), chunks[i].size(), random_hash, 4, mh);
+                if (memcmp(mh, wanted, 4) == 0) {
+                    matched = true;
+                    TEST_ASSERT_TRUE(inbound.receive_part(chunks[i]));
+                    break;
+                }
+            }
+            TEST_ASSERT_TRUE(matched);
+        }
+        TEST_ASSERT_TRUE(requested_in_round <= RNS::Type::Resource::WINDOW);
+    }
+
+    // 10 parts at a window of 4 must take more than one round (4 + 4 + 2) --
+    // the exact bug: a single-round implementation would have given up here.
+    TEST_ASSERT_TRUE(rounds >= 3);
+    TEST_ASSERT_EQUAL(kNumParts, inbound.received_count());
+    TEST_ASSERT_TRUE(inbound.is_complete());
+    TEST_ASSERT_EQUAL(0, inbound.next_request().size());  // nothing left to ask for
+}
+
 // ── Test 9: bz2 compress/decompress roundtrip ───────────────────────
 
 void testBz2CompressDecompress() {
@@ -283,6 +374,7 @@ int main(int argc, char **argv) {
     RUN_TEST(testResourceFlags);
     RUN_TEST(testAdvertisementNilRequestId);
     RUN_TEST(testAdvertisementWithRequestId);
+    RUN_TEST(testInboundResourceCompletesAcrossMultipleWindows);
     RUN_TEST(testBz2CompressDecompress);
     RUN_TEST(testTryCompress);
     RUN_TEST(testBz2CrossPlatformFormat);

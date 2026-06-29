@@ -61,6 +61,12 @@ namespace RNS {
 		uint16_t _stale_time = Type::Link::STALE_TIME;
 		bool _watchdog_lock = false;
 		double _activated_at = 0.0;
+		// Set when __watchdog_job() transitions this link ACTIVE -> STALE;
+		// gates the STALE -> CLOSED transition behind the same
+		// rtt*keepalive_timeout_factor + STALE_GRACE grace period the
+		// reference implementation waits before giving up entirely (see
+		// Link::__watchdog_job()).
+		double _stale_at = 0.0;
 		// CBA LINK
 		//Type::Destination::types _type = Type::Destination::LINK;
 		Destination _owner = {Type::NONE};

@@ -8,6 +8,7 @@
 #include "Bytes.h"
 #include "Type.h"
 #include "Cryptography/Hashes.h"
+#include "Utilities/OS.h"
 
 #include <memory>
 #include <vector>
@@ -122,6 +123,17 @@ public:
     const uint8_t* resource_hash() const { return _resource_hash; }
     const uint8_t* random_hash() const { return _random_hash; }
 
+    // ── Retransmission (see Link::__watchdog_job()) ─────────────────────
+    // Nothing about this class times itself out on its own -- there's no
+    // thread/timer here, just state. Link is responsible for noticing no
+    // RESOURCE_REQ/RESOURCE_PRF has arrived in too long and re-sending the
+    // advertisement, bounded by these counters.
+    double last_activity_at() const { return _last_activity_at; }
+    void mark_activity() { _last_activity_at = Utilities::OS::time(); }
+    int retries() const { return _retries; }
+    void increment_retries() { _retries++; }
+    void mark_failed() { _status = ResourceStatus::FAILED; }
+
 private:
     std::vector<Bytes> _parts;          // encrypted chunks
     Bytes _hashmap;                     // concatenated 4-byte map hashes
@@ -133,6 +145,8 @@ private:
     ResourceFlags _flags;
     Bytes _expected_proof;
     ResourceStatus _status = ResourceStatus::NONE;
+    double _last_activity_at = 0.0;
+    int _retries = 0;
 };
 
 // ---- Inbound Resource (receiver) ----
@@ -157,14 +171,32 @@ public:
     /// Generate the proof to send back to sender.
     Bytes generate_proof() const;
 
-    /// Get initial request (map hashes we need).
-    Bytes get_initial_request() const;
+    /// Builds a request for the next batch (up to _window) of still-missing
+    /// parts, in order. Idempotent when nothing new has arrived since the
+    /// last call -- recomputes from scratch each time rather than tracking
+    /// a separate watermark, so calling it again (e.g. on a retry timeout,
+    /// see Link::__watchdog_job()) naturally re-requests the same batch if
+    /// nothing arrived, and naturally advances once parts do. Returns an
+    /// empty Bytes once nothing is missing (complete, or assembly pending).
+    Bytes next_request();
+
+    /// True once enough parts have arrived since the last request was sent
+    /// to justify asking for the next batch (event-driven advance, as
+    /// opposed to next_request()'s timeout-driven retry of the same batch
+    /// -- see Link's RESOURCE packet handler).
+    bool should_request_more() const { return _received_since_request >= _window && !is_complete(); }
 
     size_t num_parts() const { return _total_parts; }
     size_t received_count() const { return _received; }
     const uint8_t* resource_hash() const { return _resource_hash; }
 
     ResourceStatus status() const { return _status; }
+
+    // ── Retransmission (see Link::__watchdog_job()) ─────────────────────
+    double last_request_at() const { return _last_request_at; }
+    int retries() const { return _retries; }
+    void increment_retries() { _retries++; }
+    void mark_failed() { _status = ResourceStatus::FAILED; }
 
 private:
     std::vector<Bytes> _parts;          // received chunks (indexed by part number)
@@ -179,6 +211,9 @@ private:
     ResourceFlags _flags;
     ResourceStatus _status = ResourceStatus::NONE;
     size_t _window = 4;                 // current receive window
+    size_t _received_since_request = 0;
+    double _last_request_at = 0.0;
+    int _retries = 0;
 };
 
 // ---- Legacy Resource class (compatibility wrapper) ----

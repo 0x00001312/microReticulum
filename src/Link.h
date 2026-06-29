@@ -200,6 +200,10 @@ namespace RNS {
 		void link_closed();
 		void start_watchdog();
 		void __watchdog_job();
+		// Retransmission for stalled _inbound_resources/_outbound_resources
+		// entries (see Resource.h) -- called from __watchdog_job() for ACTIVE
+		// links, not meant to be called standalone.
+		void resource_watchdog_tick();
 		void send_keepalive();
 		void handle_request(const Bytes& request_id, const ResourceRequest& unpacked_request);
 		void handle_response(const Bytes& request_id, const Bytes& response_data, size_t response_size, size_t response_transfer_size);
