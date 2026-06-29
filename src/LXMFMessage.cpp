@@ -100,6 +100,35 @@ std::vector<uint8_t> LXMFMessage::packContent(double timestamp, const std::strin
     return buf;
 }
 
+std::vector<uint8_t> LXMFMessage::appendStampToPacked(const std::vector<uint8_t>& packed4, const RNS::Bytes& stamp) {
+    // `packed4` is a packContent()-style buffer: [0x94][ts][title][content][fields].
+    // Only the leading array-count byte changes (0x94 -> 0x95); everything
+    // else is reused byte-for-byte, then the stamp is appended as a
+    // msgpack bin value -- exactly what re-encoding [ts,title,content,
+    // fields,stamp] as a 5-element array would produce, without needing a
+    // general-purpose msgpack array re-encoder.
+    std::vector<uint8_t> wireContent;
+    wireContent.reserve(packed4.size() + 2 + stamp.size());
+    wireContent.push_back(0x95);
+    wireContent.insert(wireContent.end(), packed4.begin() + 1, packed4.end());
+    mpPackBin(wireContent, std::string((const char*)stamp.data(), stamp.size()));
+    return wireContent;
+}
+
+std::vector<uint8_t> LXMFMessage::canonicalHashInput(const uint8_t* destAndSrc32, const uint8_t* content, size_t fieldsEnd) {
+    // Reconstructs the canonical 4-element form ([ts,title,content,fields],
+    // no stamp) that the hash/signature were computed over on the sending
+    // side, regardless of whether a 5th (stamp) element followed on the
+    // wire -- see appendStampToPacked() for why only the leading
+    // array-count byte ever differs.
+    std::vector<uint8_t> hashInput;
+    hashInput.reserve(32 + fieldsEnd);
+    hashInput.insert(hashInput.end(), destAndSrc32, destAndSrc32 + 32);
+    hashInput.push_back(0x94);
+    hashInput.insert(hashInput.end(), content + 1, content + fieldsEnd);
+    return hashInput;
+}
+
 std::vector<uint8_t> LXMFMessage::packFull(const RNS::Identity& signingIdentity) {
     std::vector<uint8_t> packed = packContent(timestamp, content, title);
     if (sourceHash.size() < 16 || destHash.size() < 16) return {};
@@ -126,13 +155,20 @@ std::vector<uint8_t> LXMFMessage::packFull(const RNS::Identity& signingIdentity)
     RNS::Bytes sig = signingIdentity.sign(signableBytes);
     if (sig.size() < 64) return {};
 
+    // If a stamp is attached, the wire payload's array grows from 4 to 5
+    // elements ([ts,title,content,fields,stamp]) -- but the stamp is never
+    // part of what's hashed/signed above (it can't be: a stamp is computed
+    // *from* messageId, which is itself derived from the hash, so it has
+    // to sit outside the signed envelope).
+    std::vector<uint8_t> wireContent = stamp.size() > 0 ? appendStampToPacked(packed, stamp) : packed;
+
     // Wire (opportunistic): [src_hash:16][signature:64][packed_content]
     // dest_hash is carried by the RNS packet header, not the LXMF payload
     std::vector<uint8_t> payload;
-    payload.reserve(16 + 64 + packed.size());
+    payload.reserve(16 + 64 + wireContent.size());
     payload.insert(payload.end(), sourceHash.data(), sourceHash.data() + 16);
     payload.insert(payload.end(), sig.data(), sig.data() + 64);
-    payload.insert(payload.end(), packed.begin(), packed.end());
+    payload.insert(payload.end(), wireContent.begin(), wireContent.end());
     return payload;
 }
 
@@ -154,18 +190,28 @@ bool LXMFMessage::unpackFull(const uint8_t* data, size_t len, LXMFMessage& msg) 
     if (arrLen < 3) return false;
     pos++;
 
-    // LXMF spec: [timestamp, title, content, fields]
+    // LXMF spec: [timestamp, title, content, fields, stamp?]
     if (!mpReadFloat64(content, contentLen, pos, msg.timestamp)) return false;
     if (!mpReadString(content, contentLen, pos, msg.title)) return false;
     if (!mpReadString(content, contentLen, pos, msg.content)) return false;
     if (arrLen >= 4 && pos < contentLen) { mpSkipValue(content, contentLen, pos); }
 
-    // messageId = SHA256(dest + src + packed_content), matching Python/Rust
-    // (skip signature at bytes 32..96)
-    std::vector<uint8_t> hashInput;
-    hashInput.reserve(32 + (len - 96));
-    hashInput.insert(hashInput.end(), data, data + 32);       // dest_hash + src_hash
-    hashInput.insert(hashInput.end(), data + 96, data + len);  // packed_content
+    // Everything up to here (minus the leading array-count byte) is the
+    // canonical 4-element form the hash/signature were computed over on
+    // the sending side -- record where it ends before optionally reading
+    // a 5th (stamp) element, which sits *outside* the hashed envelope.
+    size_t fieldsEnd = pos;
+
+    if (arrLen >= 5) {
+        std::string stampStr;
+        if (mpReadString(content, contentLen, pos, stampStr)) {
+            msg.stamp = RNS::Bytes((const uint8_t*)stampStr.data(), stampStr.size());
+        }
+    }
+
+    // messageId = SHA256(dest + src + canonical_4elem_packed_content),
+    // matching Python/Rust.
+    std::vector<uint8_t> hashInput = canonicalHashInput(data, content, fieldsEnd);
     RNS::Bytes hashable(hashInput.data(), hashInput.size());
     msg.messageId = RNS::Identity::full_hash(hashable);
     msg.incoming = true;
@@ -177,6 +223,7 @@ const char* LXMFMessage::statusStr() const {
     switch (status) {
         case LXMFStatus::DRAFT: return "draft";
         case LXMFStatus::QUEUED: return "queued";
+        case LXMFStatus::STAMPING: return "stamping";
         case LXMFStatus::SENDING: return "sending";
         case LXMFStatus::SENT: return "sent";
         case LXMFStatus::DELIVERED: return "delivered";
