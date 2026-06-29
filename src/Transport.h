@@ -487,6 +487,13 @@ namespace RNS {
 		static std::set<Link> _pending_links;		// Links that are being established
 		static std::set<Link> _active_links;		// Links that are active
 		static std::set<Bytes> _packet_hashlist;	// A list of packet hashes for duplicate detection
+		// Insertion order for _packet_hashlist, oldest-first. _packet_hashlist
+		// itself is ordered by hash *value* (it's a std::set, used for its
+		// O(log n) "have we seen this" lookup), which has no relationship to
+		// when each hash was learned -- see note_packet_hash() and its
+		// use in the hashlist culling in jobs().
+		static std::list<Bytes> _packet_hashlist_order;
+		static void note_packet_hash(const Bytes& hash);
 		static std::list<PacketReceipt> _receipts;	// Receipts of all outgoing packets for proof processing
 
 		// TODO: "destination_table" should really be renamed to "path_table"

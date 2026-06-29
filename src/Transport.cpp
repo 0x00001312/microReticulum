@@ -40,6 +40,7 @@ using namespace RNS::Utilities;
 /*static*/ std::set<Link> Transport::_pending_links;
 /*static*/ std::set<Link> Transport::_active_links;
 /*static*/ std::set<Bytes> Transport::_packet_hashlist;
+/*static*/ std::list<Bytes> Transport::_packet_hashlist_order;
 /*static*/ std::list<PacketReceipt> Transport::_receipts;
 
 /*static*/ Transport::AnnounceTable Transport::_announce_table;
@@ -468,11 +469,18 @@ Transport::DestinationEntry empty_destination_entry;
 				_announces_last_checked = OS::time();
 			}
 
-			// Cull the packet hashlist if it has reached its max size
-			if (_packet_hashlist.size() > _hashlist_maxsize) {
-				std::set<Bytes>::iterator iter = _packet_hashlist.begin();
-				std::advance(iter, _packet_hashlist.size() - _hashlist_maxsize);
-				_packet_hashlist.erase(_packet_hashlist.begin(), iter);
+			// Cull the packet hashlist if it has reached its max size. Evict
+			// in genuine insertion order (oldest-first) via
+			// _packet_hashlist_order -- _packet_hashlist is a std::set<Bytes>
+			// ordered by hash *value*, so erasing from its .begin() (as this
+			// used to) discarded whichever hashes happened to be numerically
+			// smallest, not the oldest ones. Under any sustained traffic that
+			// silently defeats duplicate detection: a hash from moments ago
+			// can get evicted while a hash from an hour ago, lucky enough to
+			// sort low, lingers indefinitely.
+			while (_packet_hashlist.size() > _hashlist_maxsize && !_packet_hashlist_order.empty()) {
+				_packet_hashlist.erase(_packet_hashlist_order.front());
+				_packet_hashlist_order.pop_front();
 			}
 
 			// Cull the path request tags list if it has reached its max size
@@ -1127,7 +1135,7 @@ Transport::DestinationEntry empty_destination_entry;
 					}
 					if (!stored_hash) {
 						// CBA ACCUMULATES
-						_packet_hashlist.insert(packet.packet_hash());
+						note_packet_hash(packet.packet_hash());
 						stored_hash = true;
 					}
 
@@ -1435,7 +1443,7 @@ Transport::DestinationEntry empty_destination_entry;
 		}
 		if (remember_packet_hash) {
 			// CBA ACCUMULATES
-			_packet_hashlist.insert(packet.packet_hash());
+			note_packet_hash(packet.packet_hash());
 		}
 
 		// Only cache packets on transport nodes (endpoints don't re-forward)
@@ -1735,7 +1743,7 @@ Transport::DestinationEntry empty_destination_entry;
 						transmit(outbound_interface, new_raw);
 						link_entry._timestamp = OS::time();
 						// Deferred hashlist insertion for link transport packets
-						_packet_hashlist.insert(packet.packet_hash());
+						note_packet_hash(packet.packet_hash());
 					}
 					else {
 						//p pass
@@ -3476,6 +3484,20 @@ TRACEF("announce_packet str: %s", announce_packet.toString().c_str());
 		return OS::from_bytes_big_endian(random_blob.data() + 5, 5);
 	}
 	return 0;
+}
+
+// Inserts into _packet_hashlist while keeping _packet_hashlist_order (see
+// Transport.h) consistent with it, so the size-based culling in jobs() can
+// evict the genuinely oldest entries instead of just the lowest-valued ones.
+/*static*/ void Transport::note_packet_hash(const Bytes& hash) {
+	if (_packet_hashlist.insert(hash).second) {
+		// .second is true only when this was actually a new entry --
+		// insert() on an already-present hash is a no-op on the set and
+		// must not add a second order entry for it, or culling would later
+		// try to erase the same hash twice while an older, still-present
+		// one overstays.
+		_packet_hashlist_order.push_back(hash);
+	}
 }
 
 /*static*/ void Transport::write_packet_hashlist() {
