@@ -25,6 +25,37 @@ using namespace RNS::Type::Link;
 using namespace RNS::Cryptography;
 using namespace RNS::Utilities;
 
+namespace {
+// Decodes the `[request_id, response_data]` 2-element envelope a request
+// response is always wrapped in (see Link::request()'s `//p` Python
+// reference comments). request_id is always raw bytes (a truncated hash),
+// always msgpack bin8/bin16 -- but response_data can be *any* msgpack
+// value (an array, nil, a single int error code, etc, see e.g. LXMF's
+// propagation "/get" responses), which the generic MsgPack::Unpacker
+// can't capture into a single typed variable. Since response_data is
+// always the last array element, everything after request_id's encoded
+// span is exactly response_data's raw, still-packed bytes -- hand those
+// back unparsed so the caller can decode whatever shape it actually
+// expects, instead of forcing it through a bin_t<uint8_t> that only
+// matches if the response happens to be bin-typed.
+bool unpackResponseEnvelope(const Bytes& packed, Bytes& requestId, Bytes& responseDataRaw) {
+	const uint8_t* d = packed.data();
+	size_t len = packed.size();
+	if (len < 2) return false;
+	size_t pos = 1;  // skip the fixarray(2) header byte
+	size_t idLen = 0, idHdr = 0;
+	uint8_t b = d[pos];
+	if (b == 0xC4 && pos + 1 < len) { idLen = d[pos + 1]; idHdr = 2; }
+	else if (b == 0xC5 && pos + 2 < len) { idLen = ((size_t)d[pos + 1] << 8) | d[pos + 2]; idHdr = 3; }
+	else return false;
+	if (pos + idHdr + idLen > len) return false;
+	requestId = Bytes(&d[pos + idHdr], idLen);
+	size_t dataStart = pos + idHdr + idLen;
+	responseDataRaw = Bytes(&d[dataStart], len - dataStart);
+	return true;
+}
+}
+
 /*static*/ uint8_t Link::resource_strategies = ACCEPT_NONE | ACCEPT_APP | ACCEPT_ALL;
 
 /*static*/ std::set<link_mode> Link::ENABLED_MODES = {MODE_AES256_CBC};
@@ -514,9 +545,21 @@ const RNS::RequestReceipt Link::request(const Bytes& path, const Bytes& data /*=
 
 	//p unpacked_request = [OS::time(), request_path_hash, data]
 	//p packed_request = umsgpack.packb(unpacked_request)
+	// `data` is spliced in raw, not packed via to_array() -- to_array()
+	// would serialize a Bytes argument as msgpack "bin" (see Types.h's
+	// bin_t overload), but Python's umsgpack.packb() embeds `data` as
+	// whatever native value the caller built (an array, nil, etc, NOT
+	// wrapped in bin). Callers here must pre-encode `data` as a complete,
+	// valid msgpack value themselves (see e.g. PropagationClient's
+	// packListRequest()); splicing it in unwrapped reproduces exactly what
+	// Python would emit for a native `data` argument.
     MsgPack::Packer packer;
-	packer.to_array(OS::time(), request_path_hash, data);
-	Bytes packed_request(packer.data(), packer.size());
+	packer.pack(OS::time());
+	packer.pack(request_path_hash);
+	Bytes packed_request;
+	packed_request.append((uint8_t)0x93);  // fixarray, 3 elements
+	packed_request.append(packer.data(), packer.size());
+	packed_request.append(data);
 
 	if (timeout == 0.0) {
 		timeout = _object->_rtt * _object->_traffic_timeout_factor + Type::Resource::RESPONSE_MAX_GRACE_TIME * 1.125;
@@ -1031,11 +1074,11 @@ void Link::response_resource_concluded(const Resource& resource) {
 		//p unpacked_response = umsgpack.unpackb(packed_response)
 		//p request_id        = unpacked_response[0]
 		//p response_data     = unpacked_response[1]
-		MsgPack::Unpacker unpacker;
-		unpacker.feed(packed_response.data(), packed_response.size());
-		MsgPack::bin_t<uint8_t> request_id;
-		MsgPack::bin_t<uint8_t> response_data;
-		unpacker.from_array(request_id, response_data);
+		Bytes request_id, response_data;
+		if (!unpackResponseEnvelope(packed_response, request_id, response_data)) {
+			ERROR("Failed to unpack response envelope from resource");
+			return;
+		}
 
 		handle_response(request_id, response_data, resource.total_size(), resource.size());
 	}
@@ -1199,15 +1242,13 @@ void Link::receive(const Packet& packet) {
 							//p request_id = unpacked_response[0]
 							//p response_data = unpacked_response[1]
                             //p transfer_size = len(umsgpack.packb(response_data))-2
-							MsgPack::Unpacker unpacker;
-							unpacker.feed(packed_response.data(), packed_response.size());
-							MsgPack::bin_t<uint8_t> request_id;
-							MsgPack::bin_t<uint8_t> response_data;
-							unpacker.from_array(request_id, response_data);
-							MsgPack::Packer packer;
-							packer.serialize(response_data);
-							size_t transfer_size = packer.size() - 2;
-							handle_response(Bytes(request_id.data(), request_id.size()), Bytes(response_data.data(), response_data.size()), transfer_size, transfer_size);
+							Bytes request_id, response_data;
+							if (!unpackResponseEnvelope(packed_response, request_id, response_data)) {
+								ERROR("Failed to unpack response envelope from packet");
+								break;
+							}
+							size_t transfer_size = response_data.size();
+							handle_response(request_id, response_data, transfer_size, transfer_size);
 						}
 					}
 					catch (std::exception& e) {
