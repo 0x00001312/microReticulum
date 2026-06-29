@@ -3,7 +3,10 @@
 /// Validates announce wire format matches Python/Rust implementations.
 
 #include <unity.h>
+#include "../common/filesystem/FileSystem.h"
 #include "Identity.h"
+#include "Reticulum.h"
+#include "Transport.h"
 #include "Cryptography/Hashes.h"
 
 #include <string.h>
@@ -214,6 +217,97 @@ void testNameHashes() {
     printHex("nomadnetwork.node", nh3);
 }
 
+// ── Test 7: Handler dispatch only fires for its own aspect ──────────
+//
+// This is what rsCardputer-CE's AnnounceManager ("lxmf.delivery" filter)
+// and PropagationClient ("lxmf.propagation" filter) both depend on: a
+// node that announces only "lxmf.propagation" must never reach a handler
+// registered for "lxmf.delivery", even though both destinations can share
+// the same underlying Identity (a common real-world case -- e.g. a
+// NomadNet node with propagation enabled announces both aspects from one
+// identity, one destination per aspect).
+
+namespace dispatch_test {
+
+class LoopbackIn : public RNS::InterfaceImpl {
+public:
+    LoopbackIn(const char *name = "DispatchTestIn") : RNS::InterfaceImpl(name) { _OUT = false; _IN = true; }
+    virtual void send_outgoing(const RNS::Bytes &data) {}
+};
+class LoopbackOut : public RNS::InterfaceImpl {
+public:
+    LoopbackOut(RNS::Interface& in, const char *name = "DispatchTestOut") : RNS::InterfaceImpl(name), _in(in) { _OUT = true; _IN = false; }
+    virtual void send_outgoing(const RNS::Bytes &data) {
+        _in.handle_incoming(data);
+        InterfaceImpl::handle_outgoing(data);
+    }
+private:
+    RNS::Interface& _in;
+};
+
+static int delivery_hits = 0;
+static int propagation_hits = 0;
+
+class DeliveryHandler : public RNS::AnnounceHandler {
+public:
+    DeliveryHandler() : AnnounceHandler("lxmf.delivery") {}
+    virtual void received_announce(const RNS::Bytes&, const RNS::Identity&, const RNS::Bytes&) { delivery_hits++; }
+};
+class PropagationHandler : public RNS::AnnounceHandler {
+public:
+    PropagationHandler() : AnnounceHandler("lxmf.propagation") {}
+    virtual void received_announce(const RNS::Bytes&, const RNS::Identity&, const RNS::Bytes&) { propagation_hits++; }
+};
+
+} // namespace dispatch_test
+
+void testHandlerDispatchIsAspectExclusive() {
+    using namespace dispatch_test;
+
+    RNS::FileSystem fs = new FileSystem();
+    ((FileSystem*)fs.get())->init();
+    RNS::Utilities::OS::register_filesystem(fs);
+
+    static RNS::Interface in_iface(new LoopbackIn());
+    static RNS::Interface out_iface(new LoopbackOut(in_iface));
+    RNS::Transport::register_interface(in_iface);
+    RNS::Transport::register_interface(out_iface);
+
+    RNS::Bytes tprv;
+    tprv.assignHex("BABEBABEBABEBABEBABEBABEBABEBABEBABEBABEBABEBABEBABEBABEBABEBABEBABEBABEBABEBABEBABEBABEBABEBABEBABEBABEBABEBABEBABEBABEBABEBABE");
+    RNS::Identity transport_identity(false);
+    transport_identity.load_private_key(tprv);
+    RNS::Transport::identity(transport_identity);
+
+    RNS::Reticulum reticulum = RNS::Reticulum();
+    reticulum.transport_enabled(true);
+    reticulum.start();
+
+    RNS::Identity peer(false);
+    RNS::Bytes prv;
+    prv.assignHex("E0D43398EDC974EBA9F4A83463691A08F4D306D4E56BA6B275B8690A2FBD9852E9EBE7C03BC45CAEC9EF8E78C830037210BFB9986F6CA2DEE2B5C28D7B4DE6B0");
+    peer.load_private_key(prv);
+
+    static RNS::HAnnounceHandler delivery_handler(new DeliveryHandler());
+    static RNS::HAnnounceHandler propagation_handler(new PropagationHandler());
+    RNS::Transport::register_announce_handler(delivery_handler);
+    RNS::Transport::register_announce_handler(propagation_handler);
+
+    // Only ever announces "lxmf.propagation" (e.g. a headless PN with no
+    // local delivery destination of its own). Deregister right after
+    // construction so the looped-back announce is processed as if it came
+    // from a genuinely remote node, matching the real deployment.
+    RNS::Destination pn_dest(peer, RNS::Type::Destination::IN, RNS::Type::Destination::SINGLE, "lxmf", "propagation");
+    RNS::Transport::deregister_destination(pn_dest);
+    pn_dest.announce(RNS::Bytes());
+
+    TEST_ASSERT_EQUAL(0, delivery_hits);
+    TEST_ASSERT_EQUAL(1, propagation_hits);
+
+    reticulum = {RNS::Type::NONE};
+    RNS::Utilities::OS::remove_file("destination_table");
+}
+
 // ── Runner ──────────────────────────────────────────────────────────
 
 void setUp() {}
@@ -227,5 +321,6 @@ int main(int argc, char **argv) {
     RUN_TEST(testAppDataExtraction);
     RUN_TEST(testDestHashFromIdentity);
     RUN_TEST(testNameHashes);
+    RUN_TEST(testHandlerDispatchIsAspectExclusive);
     return UNITY_END();
 }
