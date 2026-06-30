@@ -1890,7 +1890,7 @@ RequestReceipt::RequestReceipt(const Link& link, const PacketReceipt& packet_rec
 		_object->_timeout = timeout;
 	}
 	else {
-		throw new std::invalid_argument("No timeout specified for request receipt");
+		throw std::invalid_argument("No timeout specified for request receipt");
 	}
 
 	_object->_callbacks._response = response_callback;
